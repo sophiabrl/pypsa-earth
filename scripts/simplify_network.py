@@ -314,6 +314,40 @@ def contains_ac(ls):
 
     return any(list(map(lambda x: is_ac_branch(x), ls)))
 
+def remove_converters(n):
+    """
+    Remove all converters from the network and remap all buses that were originally connected to the
+    converter to the connected AC bus. Preparation step before simplifying links.
+    Parameters:
+        n (pypsa.Network): The network object.
+    Returns:
+        n (pypsa.Network): The network object with all converters removed.
+    """
+    # Extract converters
+    converters = n.links.query("carrier == 'B2B'")[["bus0", "bus1"]]
+    converters["bus0_carrier"] = converters["bus0"].map(n.buses.carrier)
+    converters["bus1_carrier"] = converters["bus1"].map(n.buses.carrier)
+
+    converters["ac_bus"] = converters.apply(
+        lambda x: x["bus1"] if x["bus1_carrier"] == "AC" else x["bus0"], axis=1
+    )
+
+    converters["dc_bus"] = converters.apply(
+        lambda x: x["bus1"] if x["bus1_carrier"] == "DC" else x["bus0"], axis=1
+    )
+
+    # Dictionary for remapping
+    dict_dc_to_ac = dict(zip(converters["dc_bus"], converters["ac_bus"]))
+
+    # Remap all buses that were originally connected to the converter to the connected AC bus
+    n.links["bus0"] = n.links["bus0"].replace(dict_dc_to_ac)
+    n.links["bus1"] = n.links["bus1"].replace(dict_dc_to_ac)
+
+    # Remove all converters from network.links and associated dc buses from network.buses
+    n.links = n.links.loc[~n.links.index.isin(converters.index)]
+    n.buses = n.buses.loc[~n.buses.index.isin(converters["dc_bus"])]
+
+    return n
 
 def simplify_links(
     n,
@@ -986,18 +1020,40 @@ def nearest_shape(n, path_shapes, distance_crs):
 
     shapes = gpd.read_file(path_shapes, crs=distance_crs).set_index("name")["geometry"]
 
+    # Country-specific distance thresholds
+    custom_threshold = {
+        "SG": 0.1,  # Singapore
+    }
     for i in n.buses.index:
         point = Point(n.buses.loc[i, "x"], n.buses.loc[i, "y"])
-        distance = shapes.distance(point).sort_values()
-        if distance.iloc[0] < 1:
-            n.buses.loc[i, "country"] = distance.index[0]
+        current_country = n.buses.loc[i, "country"]
+
+        contains = shapes.geometry.apply(lambda geom: point.within(geom))
+        if contains.any():
+            n.buses.loc[i, "country"] = contains.idxmax()
         else:
-            logger.info(
-                f"The bus {i} is {distance.iloc[0]} km away from {distance.index[0]} "
+            distance = shapes.distance(point).sort_values()
+            nearest_country = distance.index[0]
+            nearest_distance = distance.iloc[0]
+            threshold = custom_threshold.get(nearest_country, 1)
+
+            logger.warning(
+                f"[Bus {i}] Current: {current_country}, Closest: {nearest_country} at {nearest_distance:.4f} km (threshold: {threshold})"
             )
 
-    return n
+            if nearest_distance < threshold:
+                n.buses.loc[i, "country"] = nearest_country
+                logger.warning(f"[Bus {i}] -> ASSIGNED to {nearest_country}")
+            else:
+                current_country = n.buses.loc[i, "country"]  
+                if isinstance(current_country, str) and "_" in current_country:
+                    fallback = current_country.split("_")[0]
+                    n.buses.loc[i, "country"] = fallback
+                    logger.warning(f"[Bus {i}] -> FALLBACK to base country: {fallback}")
+                else:
+                    logger.warning(f"[Bus {i}] -> SKIPPED assignment. Keeping original: {current_country}")
 
+    return n
 
 if __name__ == "__main__":
     if "snakemake" not in globals():
@@ -1034,6 +1090,21 @@ if __name__ == "__main__":
         },
     )
 
+    subregion_config = snakemake.params.subregion
+    if subregion_config["define_by_gadm"]:
+        logger.info("Activate subregion classificaition based on GADM")
+        subregion_shapes = snakemake.input.subregion_shapes
+    elif subregion_config["path_custom_shapes"]:
+        logger.info("Activate subregion classificaition based on custom shapes")
+        subregion_shapes = subregion_config["path_custom_shapes"]
+    else:
+        subregion_shapes = False
+
+    if subregion_shapes:
+        distance_crs = snakemake.params.crs["distance_crs"]
+        n = nearest_shape(n, subregion_shapes, distance_crs)
+
+
     n, trafo_map = simplify_network_to_base_voltage(n, linetype, base_voltage)
 
     Nyears = n.snapshot_weightings.objective.sum() / 8760
@@ -1044,6 +1115,8 @@ if __name__ == "__main__":
         snakemake.params.electricity,
         Nyears,
     )
+
+    n = remove_converters(n)
 
     n, simplify_links_map = simplify_links(
         n,
